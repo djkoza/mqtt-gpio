@@ -1,0 +1,17 @@
+[Unit]
+Description=MQTT Shutter Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mqtt
+WorkingDirectory=/home/koza/mqtt/mqtt-gpio
+ExecStart=/usr/bin/python3 apps/shutter_server.py
+Restart=always
+RestartSec=2
+StartLimitBurst=5
+StartLimitInterval=30s
+
+[Install]
+WantedBy=multi-user.target

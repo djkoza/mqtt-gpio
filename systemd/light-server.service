@@ -1,0 +1,18 @@
+[Unit]
+Description=MQTT Light Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mqtt
+WorkingDirectory=/home/koza/mqtt/mqtt-gpio
+ExecStart=/usr/bin/python3 apps/light_server.py
+Restart=always
+RestartSec=2
+# Let systemd handle bursts with built-in rate limit
+StartLimitBurst=5
+StartLimitInterval=30s
+
+[Install]
+WantedBy=multi-user.target

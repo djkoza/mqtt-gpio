@@ -1,0 +1,5 @@
+PyYAML>=6.0
+paho-mqtt>=1.6
+RPi.GPIO>=0.7
+smbus2>=0.4
+spidev>=3.6
