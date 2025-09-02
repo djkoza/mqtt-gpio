@@ -20,33 +20,34 @@ A modular **MQTT + GPIO** stack for Raspberry Pi:
 
 ---
 
-## Repository layout
+## Repository Structure
 
+```text
 mqtt-gpio/
 ├── apps/
-│ ├── shutter_server.py
-│ ├── light_server.py
-│ └── button_client.py
-├── mqtt_gpio/ # shared modules
-│ ├── init.py
-│ ├── config.py
-│ ├── logging_setup.py
-│ ├── mqtt_base.py
-│ ├── safety.py
-│ ├── gpio_driver.py
-│ ├── persistence.py
-│ ├── ha_discovery.py
-│ └── expander.py # ExpanderPi wrapper (optional)
-├── ExpanderPi.py # vendor library (if you don’t install via pip)
-├── config.yaml # single config for all apps
+│   ├── shutter_server.py
+│   ├── light_server.py
+│   └── button_client.py
+├── mqtt_gpio/                 # shared modules
+│   ├── __init__.py
+│   ├── config.py
+│   ├── logging_setup.py
+│   ├── mqtt_base.py
+│   ├── safety.py
+│   ├── gpio_driver.py
+│   ├── persistence.py
+│   ├── ha_discovery.py
+│   └── expander.py            # ExpanderPi wrapper (optional)
+├── ExpanderPi.py              # vendor library (if not installed via pip)
+├── config.yaml                # single config for all apps
 ├── systemd/
-│ ├── shutter-server.service
-│ ├── light-server.service
-│ └── button-client.service
+│   ├── shutter-server.service
+│   ├── light-server.service
+│   └── button-client.service
 ├── requirements.txt
 ├── LICENSE
 └── README.md
-
+```
 
 > If you prefer installing ExpanderPi from your distro/pip, you can remove the bundled `ExpanderPi.py` and rely on the package instead.
 
@@ -60,12 +61,13 @@ mqtt-gpio/
 - Optional: **ABE Expander Pi** (MCP23017) for additional inputs
 
 `requirements.txt`:
-
+```bash
 paho-mqtt>=1.6,<2
 PyYAML>=6.0
 RPi.GPIO>=0.7
 smbus2>=0.4 # only if you use ExpanderPi
 spidev>=3.5 # only if you use ExpanderPi ADC/DAC
+```
 
 --
 
@@ -76,11 +78,15 @@ sudo apt-get install -y python3-pip python3-venv
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+```
 
-Configuration
+--
+
+## Configuration
 
 All services read config.yaml. One file, three apps. Example (excerpt):
 
+```bash
 mqtt:
   host: 192.168.1.10
   port: 1883
@@ -193,19 +199,13 @@ Discovery topics are published under ${discovery_prefix}/<component>/<object_id>
 Runtime topics (examples):
 
     Shutters
-
         Command: home/cover/<id>/set — payload: OPEN|CLOSE|STOP
-
         Set position: home/cover/<id>/set_position — payload: 0..100
-
         State: home/cover/<id>/state — payload: open|closed|opening|closing|stopped
-
         Position: home/cover/<id>/position — payload: 0..100 (int)
 
     Lights
-
         Command: home/light/<id>/set — payload: ON|OFF|TOGGLE
-
         State: home/light/<id>/state — payload: ON|OFF
 
 Availability (LWT): home/cover_devices/<device_id>/status and home/light_devices/<device_id>/status (online|offline).
@@ -217,24 +217,26 @@ Availability (LWT): home/cover_devices/<device_id>/status and home/light_devices
 
 Copy unit files from systemd/ and enable the services:
 
+```
 sudo cp systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable shutter-server.service light-server.service button-client.service
 sudo systemctl start  shutter-server.service light-server.service button-client.service
+```
 
 Check status/logs:
 
+```
 systemctl status shutter-server
 journalctl -u shutter-server -f
+```
 
 --
 
 ## Safety notes
 
     The software implements guard rails (anti-flap, minimum intervals, lockout).
-
     You are still responsible for wiring safety (flyback diodes, proper PSU, relay ratings).
-
     Use systemd restart policies and hardware fusing appropriate to your load.
 
 --
@@ -243,29 +245,31 @@ journalctl -u shutter-server -f
 
 Create a venv and install deps:
 
+```
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+```
 
 Run individual apps:
 
+```
 python apps/shutter_server.py
 python apps/light_server.py
 python apps/button_client.py
-
+```
 Linting (optional):
 
+```
 pip install ruff
 ruff check .
+```
 
 --
 
 ## Troubleshooting
 
-    Relays toggle too fast → tune safety.* thresholds; check for duplicate publishers.
-
-    Shutter never reaches end → verify travel_time_up_sec/down_sec, increase start_delay_*, ensure wiring polarity matches pins.
-
-    ExpanderPi not found → install smbus2 and spidev; ensure I²C/SPI enabled in raspi-config.
-
-    HA entities missing → check broker creds, discovery_prefix and retained discovery messages; look at homeassistant/status.
+- Relays toggle too fast → tune safety.* thresholds; check for duplicate publishers.
+- Shutter never reaches end → verify travel_time_up_sec/down_sec, increase start_delay_*, ensure wiring polarity matches pins.
+- ExpanderPi not found → install smbus2 and spidev; ensure I²C/SPI enabled in raspi-config.
+- HA entities missing → check broker creds, discovery_prefix and retained discovery messages; look at homeassistant/status.
