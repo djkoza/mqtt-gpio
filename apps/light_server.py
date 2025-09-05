@@ -83,6 +83,7 @@ LIGHT = ensure_light_dict(CFG["light"])
 ensure_board_mode()
 for oid, m in LIGHT.items():
     setup_output(m["pin"])
+    m["current_on"] = GPIO.input(m["pin"]) == GPIO.HIGH
 
 # MQTT
 client: mqtt.Client = make_client(AVAIL_TOPIC, PAYLOAD_OFFLINE, MQTT_USER, MQTT_PW)
@@ -104,10 +105,12 @@ def _cmd_topic(oid: str) -> str:
 
 def _publish_state(oid: str, force: bool=False):
     pin = LIGHT[oid]["pin"]
-    s = "ON" if GPIO.input(pin) == GPIO.HIGH else "OFF"
+    is_on = GPIO.input(pin) == GPIO.HIGH
+    s = "ON" if is_on else "OFF"
     if not force and LIGHT[oid]["last_pub_state"] == s:
         return
     LIGHT[oid]["last_pub_state"] = s
+    LIGHT[oid]["current_on"] = is_on
     client.publish(_state_topic(oid), s, retain=True)
     LOG.debug(f"Published state {s} -> {_state_topic(oid)}")
 
@@ -116,6 +119,7 @@ def _apply_light(oid: str, turn_on: bool) -> str:
     # rate limiting
     if not m["rate"].allow():
         LOG.warning(f"[SAFETY] {oid} command rate-limited")
+        _publish_state(oid, force=True)
         return "blocked-rate"
 
     def _cur():
