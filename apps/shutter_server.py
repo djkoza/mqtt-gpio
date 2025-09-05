@@ -305,7 +305,7 @@ def _force_stop(oid: str):
 
 def _snap_and_calibrate(oid: str, pos: int):
     m = COVERS[oid]
-    m["position"] = float(max(0, min(100, int(pos)))))
+    m["position"] = float(max(0, min(100, int(pos))))
     m["calibrated"] = True
     m["target"] = None
     m["inhibit_until"] = None
