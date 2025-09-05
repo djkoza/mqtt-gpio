@@ -2,9 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
-import time
-
-Now = time.monotonic
+from time import monotonic as Now
 
 @dataclass
 class FlapGuard:
@@ -28,19 +26,13 @@ class FlapGuard:
     def register_edge_and_check_flap(self) -> bool:
         """Register an edge. Return False if flapping threshold triggers lockout."""
         t = Now()
-        self.last_relay_change = t
+        window_start = t - self.flap_window_sec
+        self.edge_times = [t for t in self.edge_times if t >= window_start]
         self.edge_times.append(t)
-        w = self.flap_window_sec
-        while self.edge_times and (t - self.edge_times[0]) > w:
-            self.edge_times.pop(0)
-        if len(self.edge_times()) >= self.flap_max_edge_changes:  # defensive; corrected below
-            pass
-        # Correct threshold check:
-        if len(self.edge_times) >= self.flap_max_edge_changes:
+        if len(self.edge_times) > self.flap_max_edge_changes:
             self.lockout_until = t + self.flap_lockout_sec
             return False
         return True
-
 
 @dataclass
 class RateLimiter:
