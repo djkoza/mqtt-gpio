@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Shutter server:
+- time-based position estimation
+- HA discovery, availability, persistence
+- safety guards (flap/rate limiting)
+- travel-time learning (EMA with clamping)
+"""
 
 import os
 import sys
@@ -57,17 +64,17 @@ PAYLOAD_OFFLINE = "offline"
 # Learning defaults
 LDEF = CFG.get("learning", {})
 LEARN_ENABLED = bool(LDEF.get("enabled", True))
-LEARN_ALPHA = float(LDEF.get("alpha", 0.2))
-LEARN_CLAMP = float(LDEF.get("clamp_percent", 0.2))
+LEARN_ALPHA   = float(LDEF.get("alpha", 0.2))
+LEARN_CLAMP   = float(LDEF.get("clamp_percent", 0.2))
 
 # Movement constants
-TICK_SEC   = 0.1
-WATCHDOG_K = 1.5
+TICK_SEC     = 0.1
+WATCHDOG_K   = 1.5
 CALIB_MARGIN = 0.99  # near-end fraction of travel time when we clamp to bounds
 
 PERSIST = CFG.get("persistence", {})
-PERSIST_PATH = PERSIST.get("path", "./state.json")
-AUTOSAVE_SEC = int(PERSIST.get("autosave_sec", 3))
+PERSIST_PATH  = PERSIST.get("path", "./state.json")
+AUTOSAVE_SEC  = int(PERSIST.get("autosave_sec", 3))
 
 GLOBAL_START_DELAY_UP   = float(CFG.get("start_delay_up_sec", 0.4))
 GLOBAL_START_DELAY_DOWN = float(CFG.get("start_delay_down_sec", 0.4))
@@ -99,11 +106,10 @@ def ensure_cover_dict(covers_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             "learn_enabled": bool(meta.get("learning", {}).get("enabled", LEARN_ENABLED)),
             "learn_alpha": float(meta.get("learning", {}).get("alpha", LEARN_ALPHA)),
             "learn_clamp": float(meta.get("learning", {}).get("clamp_percent", LEARN_CLAMP)),
-            "segment_elapsed": 0.0,      # runtime of current movement segment (excludes start delay)
-            "segment_dir": None,         # 'up' | 'down'
-            "segment_start_pos": None,   # position at segment start
-            "near_end_clamped": False,   # whether we already clamped to 0/100 in this segment
-
+            "segment_elapsed": 0.0,
+            "segment_dir": None,
+            "segment_start_pos": None,
+            "near_end_clamped": False,
             # Safety helpers
             "guard": FlapGuard(
                 min_relay_interval_sec=float(meta.get("min_relay_interval_sec", SAFETY_DEFAULTS["min_relay_interval_sec"])),
@@ -300,7 +306,6 @@ def _gpio_apply_drive(oid: str, drive: str):
     m["current_drive"] = drive
 
 def _force_stop(oid: str):
-    """Force both pins low and mark drive as stopped."""
     try:
         write(COVERS[oid]["up_pin"], False)
         write(COVERS[oid]["down_pin"], False)
@@ -333,7 +338,6 @@ def _apply_learning(oid: str, direction: str, effective_time: float, distance_pc
     m = COVERS[oid]
     if not m["learn_enabled"] or distance_pct <= 0:
         return
-    # Cap distance to [1..100] to avoid tiny segments nuking the estimate.
     dist = max(1.0, min(100.0, distance_pct))
     est_full = effective_time * (100.0 / dist)
     if direction == "up":
@@ -356,6 +360,16 @@ def _apply_learning(oid: str, direction: str, effective_time: float, distance_pc
         LOG.info(f"[LEARN] {oid} down → {m['travel_down_learn']:.2f}s (est_full={est_full:.2f}s, base={base:.2f}s)")
     _mark_dirty()
     save_persist()
+
+def _min_runtime_required(oid: str, opening: bool) -> float:
+    """Proportional minimum runtime for full OPEN/CLOSE, based on learned travel."""
+    m = COVERS[oid]
+    start_delay = m["start_delay_up_sec"] if opening else m["start_delay_down_sec"]
+    travel = _current_travel_seconds(oid, opening)
+    seg_start = m["segment_start_pos"] if m["segment_start_pos"] is not None else m["position"]
+    target = 100.0 if opening else 0.0
+    dist_pct = abs(seg_start - target)
+    return start_delay + travel * (dist_pct / 100.0)
 
 def start_move_to(oid: str, target: int, last_cmd: str):
     m = COVERS[oid]
@@ -429,7 +443,7 @@ def movement_tick():
     global _last_hb
     t = now()
 
-    # debug heartbeat
+    # periodic debug heartbeat
     if t - _last_hb >= 1.0:
         for _oid, _m in COVERS.items():
             LOG.debug(f"[HB] {_oid}: state={_m['state']} pos={_m['position']:.1f} target={_m['target']} cmd={_m['last_cmd']}")
@@ -473,7 +487,7 @@ def movement_tick():
         if int(prev) != int(m["position"]):
             LOG.debug(f"[TICK] {oid} {'opening' if opening else 'closing'} dt={elapsed:.3f}s step={step:.3f} pos={m['position']:.1f}")
 
-        # watchdog hard stop to bound if runtime is way above expected
+        # watchdog: snap and STOP if runtime is far above expected
         if m["cmd_start"] and (t - m["cmd_start"]) > (WATCHDOG_K * travel):
             bound = 100 if opening else 0
             LOG.warning(f"[WATCHDOG] {oid} {'opening' if opening else 'closing'} exceeded -> snap {bound}%")
@@ -485,12 +499,12 @@ def movement_tick():
             m["near_end_clamped"] = False
             continue
 
-        # reached target (plus minimum-runtime guard for full OPEN/CLOSE)
+        # reached target (OPEN side)
         if opening and m["position"] >= m["target"]:
             m["position"] = float(m["target"])
             bound_hit = (m["target"] >= 100 and m["last_cmd"] == "OPEN")
             if bound_hit:
-                min_runtime = m["start_delay_up_sec"] + m["travel_up_cfg"]
+                min_runtime = _min_runtime_required(oid, opening=True)
                 if (t - (m["cmd_start"] or t)) < min_runtime:
                     publish_position(oid); publish_state(oid); save_persist()
                     LOG.debug(f"[GUARD] {oid} OPEN reached 100% early, enforcing min runtime {min_runtime:.2f}s")
@@ -514,11 +528,12 @@ def movement_tick():
             m["near_end_clamped"] = False
             continue
 
+        # reached target (CLOSE side)
         if (not opening) and m["position"] <= m["target"]:
             m["position"] = float(m["target"])
             bound_hit = (m["target"] <= 0 and m["last_cmd"] == "CLOSE")
             if bound_hit:
-                min_runtime = m["start_delay_down_sec"] + m["travel_down_cfg"]
+                min_runtime = _min_runtime_required(oid, opening=False)
                 if (t - (m["cmd_start"] or t)) < min_runtime:
                     publish_position(oid); publish_state(oid); save_persist()
                     LOG.debug(f"[GUARD] {oid} CLOSE reached 0% early, enforcing min runtime {min_runtime:.2f}s")
@@ -543,14 +558,13 @@ def movement_tick():
 
         publish_position(oid)
 
-        # Near-end clamp (only adjusts reported position; does NOT stop the motor)
+        # Near-end clamp (adjusts reported position; does NOT stop the motor)
         if m["last_cmd"] in ("OPEN","CLOSE") and m["cmd_start"] is not None:
             margin = CALIB_MARGIN * travel
             if m["segment_elapsed"] >= margin and not m.get("near_end_clamped", False):
                 bound = 100 if opening else 0
                 m["position"] = float(bound)
                 publish_position(oid)
-                # Optional: learn once from the partial segment before final STOP later
                 dist = abs(m["position"] - (m["segment_start_pos"] if m["segment_start_pos"] is not None else m["position"]))
                 _apply_learning(oid, "up" if opening else "down", m["segment_elapsed"], dist)
                 m["near_end_clamped"] = True
