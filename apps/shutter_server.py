@@ -63,7 +63,7 @@ LEARN_CLAMP = float(LDEF.get("clamp_percent", 0.2))
 # Movement constants
 TICK_SEC   = 0.1
 WATCHDOG_K = 1.5
-CALIB_MARGIN = 0.99
+CALIB_MARGIN = 0.99  # near-end fraction of travel time when we clamp to bounds
 
 PERSIST = CFG.get("persistence", {})
 PERSIST_PATH = PERSIST.get("path", "./state.json")
@@ -99,11 +99,12 @@ def ensure_cover_dict(covers_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             "learn_enabled": bool(meta.get("learning", {}).get("enabled", LEARN_ENABLED)),
             "learn_alpha": float(meta.get("learning", {}).get("alpha", LEARN_ALPHA)),
             "learn_clamp": float(meta.get("learning", {}).get("clamp_percent", LEARN_CLAMP)),
-            "segment_elapsed": 0.0,
-            "segment_dir": None,
-            "segment_start_pos": None,
+            "segment_elapsed": 0.0,      # runtime of current movement segment (excludes start delay)
+            "segment_dir": None,         # 'up' | 'down'
+            "segment_start_pos": None,   # position at segment start
+            "near_end_clamped": False,   # whether we already clamped to 0/100 in this segment
 
-            # Safety
+            # Safety helpers
             "guard": FlapGuard(
                 min_relay_interval_sec=float(meta.get("min_relay_interval_sec", SAFETY_DEFAULTS["min_relay_interval_sec"])),
                 flap_window_sec=float(meta.get("flap_window_sec", SAFETY_DEFAULTS["flap_window_sec"])),
@@ -114,7 +115,7 @@ def ensure_cover_dict(covers_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 min_command_interval_sec=float(meta.get("min_command_interval_sec", SAFETY_DEFAULTS["min_command_interval_sec"]))
             ),
             "current_drive": "stop",  # 'up'|'down'|'stop'
-            "lockout_until": 0.0,     # alias to guard.lockout_until through functions
+            "lockout_until": 0.0,
         }
     return out
 
@@ -141,6 +142,7 @@ def _build_snapshot() -> Dict[str, Any]:
     return snap
 
 def load_persist():
+    """Load last known state from JSON persistence file."""
     global _persist_dirty, _last_persist
     try:
         if os.path.exists(PERSIST_PATH):
@@ -152,9 +154,9 @@ def load_persist():
                     m["position"] = float(max(0, min(100, int(saved.get("position", 0)))))
                     m["calibrated"] = bool(saved.get("calibrated", False))
                     m["last_persist_bucket"] = int(m["position"]) // 5
-                    if "travel_up_learn" in saved and saved["travel_up_learn"]:
+                    if "travel_up_learn" in saved and saved["travel_up_learn"] is not None:
                         m["travel_up_learn"] = float(saved["travel_up_learn"])
-                    if "travel_down_learn" in saved and saved["travel_down_learn"]:
+                    if "travel_down_learn" in saved and saved["travel_down_learn"] is not None:
                         m["travel_down_learn"] = float(saved["travel_down_learn"])
             LOG.info(f"Persistence loaded from {PERSIST_PATH}")
         else:
@@ -171,6 +173,7 @@ def _mark_dirty():
     _persist_dirty = True
 
 def save_persist(force: bool=False):
+    """Save current state to JSON persistence file (with debounce)."""
     global _persist_dirty, _last_persist
     t = now()
     if not force and not _persist_dirty:
@@ -218,6 +221,7 @@ def device_obj() -> Dict[str, Any]:
     }
 
 def _persist_on_bucket_change(oid: str, pos_int: int):
+    """Autosave when position crosses a 5%-bucket to limit write frequency."""
     m = COVERS[oid]
     b = pos_int // 5
     if m.get("last_persist_bucket") is None:
@@ -296,6 +300,7 @@ def _gpio_apply_drive(oid: str, drive: str):
     m["current_drive"] = drive
 
 def _force_stop(oid: str):
+    """Force both pins low and mark drive as stopped."""
     try:
         write(COVERS[oid]["up_pin"], False)
         write(COVERS[oid]["down_pin"], False)
@@ -304,6 +309,7 @@ def _force_stop(oid: str):
         pass
 
 def _snap_and_calibrate(oid: str, pos: int):
+    """Hard snap to 0/100, STOP, publish and persist."""
     m = COVERS[oid]
     m["position"] = float(max(0, min(100, int(pos))))
     m["calibrated"] = True
@@ -316,22 +322,25 @@ def _snap_and_calibrate(oid: str, pos: int):
     LOG.info(f"{oid} calibrated at {int(m['position'])}%")
 
 def _current_travel_seconds(oid: str, opening: bool) -> float:
+    """Return effective full-travel time (learned if available, else configured)."""
     m = COVERS[oid]
     if opening:
         return float(m["travel_up_learn"] if m["travel_up_learn"] else m["travel_up_cfg"])
     return float(m["travel_down_learn"] if m["travel_down_learn"] else m["travel_down_cfg"])
 
 def _apply_learning(oid: str, direction: str, effective_time: float, distance_pct: float):
+    """Update learned travel time using EMA, clamped around config base."""
     m = COVERS[oid]
     if not m["learn_enabled"] or distance_pct <= 0:
         return
-    est_full = effective_time * (100.0 / distance_pct)
+    # Cap distance to [1..100] to avoid tiny segments nuking the estimate.
+    dist = max(1.0, min(100.0, distance_pct))
+    est_full = effective_time * (100.0 / dist)
     if direction == "up":
         base = m["travel_up_cfg"]
         prev = m["travel_up_learn"] if m["travel_up_learn"] else base
         alpha = m["learn_alpha"]
         newv = (1 - alpha) * prev + alpha * est_full
-        # clamp
         low = base * (1.0 - m["learn_clamp"])
         high = base * (1.0 + m["learn_clamp"])
         m["travel_up_learn"] = max(low, min(high, newv))
@@ -356,6 +365,7 @@ def start_move_to(oid: str, target: int, last_cmd: str):
     target = max(0, min(100, int(target)))
     m["last_cmd"] = last_cmd
     m["cmd_start"] = now()
+    m["near_end_clamped"] = False
 
     if target == int(round(m["position"])):
         m["target"] = None
@@ -380,7 +390,6 @@ def start_move_to(oid: str, target: int, last_cmd: str):
         m["segment_dir"] = "down"
 
     if res.startswith("blocked"):
-        # do not start movement; keep state consistent
         m["target"] = None
         m["state"] = "stopped"
         publish_state(oid, force=True)
@@ -405,6 +414,7 @@ def cmd_stop(oid: str):
     m["cmd_start"] = None
     m["target"] = None
     m["inhibit_until"] = None
+    m["near_end_clamped"] = False
     apply_state_tristate("stop", lambda: _current_drive(oid), lambda d: _gpio_apply_drive(oid, d), m["guard"], lambda: _force_stop(oid))
     m["state"] = "stopped"
     publish_state(oid)
@@ -419,7 +429,7 @@ def movement_tick():
     global _last_hb
     t = now()
 
-    # heartbeat (debug)
+    # debug heartbeat
     if t - _last_hb >= 1.0:
         for _oid, _m in COVERS.items():
             LOG.debug(f"[HB] {_oid}: state={_m['state']} pos={_m['position']:.1f} target={_m['target']} cmd={_m['last_cmd']}")
@@ -440,7 +450,7 @@ def movement_tick():
         if elapsed <= 0:
             continue
 
-        # inhibit window
+        # skip ticks during start delay window; subtract it once elapsed
         if m["inhibit_until"] is not None:
             if t < m["inhibit_until"]:
                 continue
@@ -463,7 +473,7 @@ def movement_tick():
         if int(prev) != int(m["position"]):
             LOG.debug(f"[TICK] {oid} {'opening' if opening else 'closing'} dt={elapsed:.3f}s step={step:.3f} pos={m['position']:.1f}")
 
-        # watchdog
+        # watchdog hard stop to bound if runtime is way above expected
         if m["cmd_start"] and (t - m["cmd_start"]) > (WATCHDOG_K * travel):
             bound = 100 if opening else 0
             LOG.warning(f"[WATCHDOG] {oid} {'opening' if opening else 'closing'} exceeded -> snap {bound}%")
@@ -472,58 +482,79 @@ def movement_tick():
             _apply_learning(oid, "up" if opening else "down", m["segment_elapsed"], max(1.0, dist))
             m["segment_elapsed"] = 0.0
             m["segment_start_pos"] = m["position"]
+            m["near_end_clamped"] = False
             continue
 
-        # reached target
+        # reached target (plus minimum-runtime guard for full OPEN/CLOSE)
         if opening and m["position"] >= m["target"]:
             m["position"] = float(m["target"])
             bound_hit = (m["target"] >= 100 and m["last_cmd"] == "OPEN")
+            if bound_hit:
+                min_runtime = m["start_delay_up_sec"] + m["travel_up_cfg"]
+                if (t - (m["cmd_start"] or t)) < min_runtime:
+                    publish_position(oid); publish_state(oid); save_persist()
+                    LOG.debug(f"[GUARD] {oid} OPEN reached 100% early, enforcing min runtime {min_runtime:.2f}s")
+                    continue
+            # normal stop
             m["target"] = None
             apply_state_tristate("stop", lambda: _current_drive(oid), lambda d: _gpio_apply_drive(oid, d), m["guard"], lambda: _force_stop(oid))
             if bound_hit:
-                dist = abs(m["position"] - (m["segment_start_pos"] if m["segment_start_pos"] is not None else m["position"]))
-                _apply_learning(oid, "up", m["segment_elapsed"], max(1.0, dist))
+                if not m.get("near_end_clamped", False):
+                    dist = abs(m["position"] - (m["segment_start_pos"] if m["segment_start_pos"] is not None else m["position"]))
+                    _apply_learning(oid, "up", m["segment_elapsed"], max(1.0, dist))
                 _snap_and_calibrate(oid, 100)
                 m["segment_elapsed"] = 0.0
                 m["segment_start_pos"] = m["position"]
+                m["near_end_clamped"] = False
                 continue
             publish_position(oid); publish_state(oid); save_persist()
             LOG.info(f"{oid} reached {int(m['position'])}% (OPEN side)")
             m["segment_elapsed"] = 0.0
             m["segment_start_pos"] = m["position"]
+            m["near_end_clamped"] = False
             continue
 
         if (not opening) and m["position"] <= m["target"]:
             m["position"] = float(m["target"])
             bound_hit = (m["target"] <= 0 and m["last_cmd"] == "CLOSE")
+            if bound_hit:
+                min_runtime = m["start_delay_down_sec"] + m["travel_down_cfg"]
+                if (t - (m["cmd_start"] or t)) < min_runtime:
+                    publish_position(oid); publish_state(oid); save_persist()
+                    LOG.debug(f"[GUARD] {oid} CLOSE reached 0% early, enforcing min runtime {min_runtime:.2f}s")
+                    continue
             m["target"] = None
             apply_state_tristate("stop", lambda: _current_drive(oid), lambda d: _gpio_apply_drive(oid, d), m["guard"], lambda: _force_stop(oid))
             if bound_hit:
-                dist = abs(m["position"] - (m["segment_start_pos"] if m["segment_start_pos"] is not None else m["position"]))
-                _apply_learning(oid, "down", m["segment_elapsed"], max(1.0, dist))
+                if not m.get("near_end_clamped", False):
+                    dist = abs(m["position"] - (m["segment_start_pos"] if m["segment_start_pos"] is not None else m["position"]))
+                    _apply_learning(oid, "down", m["segment_elapsed"], max(1.0, dist))
                 _snap_and_calibrate(oid, 0)
                 m["segment_elapsed"] = 0.0
                 m["segment_start_pos"] = m["position"]
+                m["near_end_clamped"] = False
                 continue
             publish_position(oid); publish_state(oid); save_persist()
             LOG.info(f"{oid} reached {int(m['position'])}% (CLOSE side)")
             m["segment_elapsed"] = 0.0
             m["segment_start_pos"] = m["position"]
+            m["near_end_clamped"] = False
             continue
 
         publish_position(oid)
 
-        # time-based near-end snap (only direct OPEN/CLOSE)
+        # Near-end clamp (only adjusts reported position; does NOT stop the motor)
         if m["last_cmd"] in ("OPEN","CLOSE") and m["cmd_start"] is not None:
             margin = CALIB_MARGIN * travel
-            if (t - m["cmd_start"]) >= margin:
+            if m["segment_elapsed"] >= margin and not m.get("near_end_clamped", False):
                 bound = 100 if opening else 0
-                _snap_and_calibrate(oid, bound)
-                LOG.info(f"{oid} recalibrated by time ({'OPEN' if opening else 'CLOSE'})")
+                m["position"] = float(bound)
+                publish_position(oid)
+                # Optional: learn once from the partial segment before final STOP later
                 dist = abs(m["position"] - (m["segment_start_pos"] if m["segment_start_pos"] is not None else m["position"]))
-                _apply_learning(oid, "up" if opening else "down", m["segment_elapsed"], max(1.0, dist))
-                m["segment_elapsed"] = 0.0
-                m["segment_start_pos"] = m["position"]
+                _apply_learning(oid, "up" if opening else "down", m["segment_elapsed"], dist)
+                m["near_end_clamped"] = True
+                LOG.info(f"{oid} near-end clamped to {bound}% (time guard)")
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
