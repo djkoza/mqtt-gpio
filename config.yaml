@@ -84,7 +84,7 @@ alsa:
   controls:
     dspvolume:
       name: "DSPVolume"
-      card: 0
+      card: "hw"
       control: "DSPVolume"
       min: 0
       max: 100

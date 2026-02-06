@@ -81,6 +81,24 @@ PAYLOAD_OFFLINE = "offline"
 _PCT_RE = re.compile(r"\[(\d+)%\]")
 
 
+def _derive_monitor_card_from_device(device: str) -> Optional[str]:
+    """Best-effort mapping from an ALSA device string to a card identifier for alsactl.
+
+    Examples:
+      - "hw:0" -> "0"
+      - "hw:PCH" -> "PCH"
+
+    For other device strings (e.g. "pulse", "default", "sysdefault:CARD=PCH"),
+    there is no reliable general mapping. In such cases we return None and the app
+    will fall back to polling only.
+    """
+    s = (device or "").strip()
+    if s.startswith("hw:"):
+        rest = s[3:].strip()
+        return rest or None
+    return None
+
+
 def device_obj() -> Dict[str, Any]:
     return {
         "identifiers": [DEVICE_ID],
@@ -108,12 +126,19 @@ def _run(cmd: list[str], timeout: float = 2.0) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def _read_pct(card: int, control: str) -> Optional[int]:
-    """Read mixer control percent (0..100). Returns None on parse/command error."""
+def _read_pct(sel_args: list[str], control: str) -> Optional[int]:
+    """Read mixer control percent (0..100).
+
+    sel_args selects the ALSA control device:
+      - ["-c", "0"] / ["-c", "PCH"]
+      - ["-D", "hw:0"] / ["-D", "default"]
+    """
     try:
-        res = _run(["amixer", "-c", str(card), "sget", control], timeout=2.0)
+        res = _run(["amixer", *sel_args, "sget", control], timeout=2.0)
         if res.returncode != 0:
-            LOG.warning(f"amixer sget failed (card={card}, control={control}): rc={res.returncode}")
+            LOG.warning(
+                f"amixer sget failed ({' '.join(sel_args)}, control={control}): rc={res.returncode}"
+            )
             return None
         m = _PCT_RE.search(res.stdout)
         if not m:
@@ -123,23 +148,25 @@ def _read_pct(card: int, control: str) -> Optional[int]:
         LOG.error("amixer not found. Install 'alsa-utils'.")
         return None
     except Exception as e:
-        LOG.warning(f"amixer sget exception (card={card}, control={control}): {e}")
+        LOG.warning(f"amixer sget exception ({' '.join(sel_args)}, control={control}): {e}")
         return None
 
 
-def _set_pct(card: int, control: str, pct: int) -> bool:
+def _set_pct(sel_args: list[str], control: str, pct: int) -> bool:
     """Set mixer control percent (0..100). Returns True if command succeeded."""
     try:
-        res = _run(["amixer", "-c", str(card), "sset", control, f"{pct}%"], timeout=2.0)
+        res = _run(["amixer", *sel_args, "sset", control, f"{pct}%"], timeout=2.0)
         if res.returncode != 0:
-            LOG.warning(f"amixer sset failed (card={card}, control={control}): rc={res.returncode}")
+            LOG.warning(
+                f"amixer sset failed ({' '.join(sel_args)}, control={control}): rc={res.returncode}"
+            )
             return False
         return True
     except FileNotFoundError:
         LOG.error("amixer not found. Install 'alsa-utils'.")
         return False
     except Exception as e:
-        LOG.warning(f"amixer sset exception (card={card}, control={control}): {e}")
+        LOG.warning(f"amixer sset exception ({' '.join(sel_args)}, control={control}): {e}")
         return False
 
 
@@ -176,7 +203,34 @@ def _ensure_controls(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if not isinstance(meta, dict):
             meta = {}
 
-        card = int(meta.get("card", 0))
+        # Selection:
+        #   - You can pass a card index or card id/name via `card` (amixer -c <card>).
+        #   - You can pass an ALSA device string via `device` (amixer -D <device>), e.g. "hw:0".
+        # If a string in `card` looks like a device string (contains ':'), we treat it as `device`.
+        card_raw = meta.get("card", 0)
+        device_raw = meta.get("device")
+
+        sel_args: list[str]
+        monitor_card: Optional[str]
+
+        if device_raw is not None:
+            device = str(device_raw)
+            sel_args = ["-D", device]
+            monitor_card = meta.get("monitor_card")
+            if monitor_card is None:
+                monitor_card = _derive_monitor_card_from_device(device)
+        else:
+            card = str(card_raw)
+            if ":" in card:
+                # Backward-compatible: allow using 'card: "hw:0"' and treat it as a device.
+                sel_args = ["-D", card]
+                monitor_card = meta.get("monitor_card")
+                if monitor_card is None:
+                    monitor_card = _derive_monitor_card_from_device(card)
+            else:
+                sel_args = ["-c", card]
+                monitor_card = str(meta.get("monitor_card", card))
+
         control = str(meta.get("control", key))
         mn = int(meta.get("min", 0))
         mx = int(meta.get("max", 100))
@@ -187,7 +241,8 @@ def _ensure_controls(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
         out[oid] = {
             "name": meta.get("name", key),
-            "card": card,
+            "sel": sel_args,
+            "monitor_card": monitor_card,
             "control": control,
             "min": mn,
             "max": mx,
@@ -212,7 +267,7 @@ _stop_event = Event()
 
 def _publish_state(oid: str, force: bool = False) -> None:
     m = CONTROLS[oid]
-    pct = _read_pct(int(m["card"]), str(m["control"]))
+    pct = _read_pct(list(m["sel"]), str(m["control"]))
     if pct is None:
         return
     pct = _clamp(pct, int(m["min"]), int(m["max"]))
@@ -251,7 +306,7 @@ def publish_discovery() -> None:
         _publish_state(oid, force=True)
 
 
-def _alsa_monitor_loop(card: int) -> None:
+def _alsa_monitor_loop(card: str) -> None:
     """Monitor ALSA events for a given card and wake the poll loop."""
     backoff_sec = 2.0
     while not _stop_event.is_set():
@@ -332,7 +387,7 @@ def on_message(client, userdata, msg):
                 _wake_event.set()
                 return
 
-            ok = _set_pct(int(m["card"]), str(m["control"]), v)
+            ok = _set_pct(list(m["sel"]), str(m["control"]), v)
             if ok:
                 LOG.info(f"Set {oid} -> {v}%")
                 _publish_state(oid, force=True)
@@ -372,7 +427,11 @@ def main():
 
     # Start ALSA monitor threads (one per unique card).
     if ENABLE_MONITOR:
-        cards: Set[int] = {int(m["card"]) for m in CONTROLS.values()}
+        cards: Set[str] = {
+            str(m["monitor_card"]) for m in CONTROLS.values() if m.get("monitor_card")
+        }
+        if not cards:
+            LOG.info("ALSA monitor enabled, but no monitor_card could be derived (polling only)")
         for c in sorted(cards):
             Thread(target=_alsa_monitor_loop, args=(c,), daemon=True).start()
     else:
