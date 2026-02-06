@@ -75,6 +75,24 @@ light:
     pin: 33
   # Per-light safety overrides are allowed (same keys as 'safety')
 
+# ALSA mixer controls exposed to HA as MQTT Number entities
+# Requires: alsa-utils (amixer, alsactl)
+alsa:
+  poll_sec: 1.0                 # periodic refresh; monitor events wake polling sooner
+  enable_monitor: true          # uses 'alsactl monitor' when available
+  # min_command_interval_sec: 0.05
+  controls:
+    dspvolume:
+      name: "DSPVolume"
+      card: 0
+      control: "DSPVolume"
+      min: 0
+      max: 100
+      step: 1
+      unit: "%"
+      icon: "mdi:volume-high"
+      # min_command_interval_sec: 0.05
+
 # Button client
 button_queue:
   max_limit: 200

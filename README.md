@@ -4,6 +4,7 @@ A modular **MQTT + GPIO** stack for Raspberry Pi:
 
 - **Shutter Server** — HA MQTT Discovery, anti-flap safety, asymmetric travel times, start-delay inhibit, watchdog, end-stop auto-calibration, travel-time learning, 5% position buckets, persistence.
 - **Light Server** — HA MQTT Discovery, anti-flap safety, per-entity rate limiting.
+- **ALSA Mixer Server** — HA MQTT Discovery (MQTT Number), two-way ALSA mixer sync (amixer set + alsactl monitor/poll), per-control command rate limiting.
 - **Button Client** — reads buttons from **GPIO** or **ExpanderPi** (MCP23017), recognizes single/double click and long-press start/end, and publishes actions to MQTT via a queued, TTL-protected dispatcher.
 
 ---
@@ -27,6 +28,7 @@ mqtt-gpio/
 ├── apps/
 │   ├── shutter_server.py
 │   ├── light_server.py
+│   ├── alsa_server.py
 │   └── button_client.py
 ├── mqtt_gpio/                 # shared modules
 │   ├── __init__.py
@@ -43,6 +45,7 @@ mqtt-gpio/
 ├── systemd/
 │   ├── shutter-server.service
 │   ├── light-server.service
+│   ├── alsa-server.service
 │   └── button-client.service
 ├── requirements.txt
 ├── LICENSE
@@ -148,6 +151,22 @@ light:
     name: "Desk Light"
     pin: 13
 
+# ALSA mixer controls (exposed as HA MQTT Number)
+# Requires: alsa-utils (amixer, alsactl)
+alsa:
+  poll_sec: 1.0
+  enable_monitor: true
+  controls:
+    dspvolume:
+      name: "DSPVolume"
+      card: 0
+      control: "DSPVolume"
+      min: 0
+      max: 100
+      step: 1
+      unit: "%"
+      icon: "mdi:volume-high"
+
 # Button client
 button_queue:
   max_limit: 200
@@ -208,6 +227,10 @@ Runtime topics (examples):
         Command: home/light/<id>/set — payload: ON|OFF|TOGGLE
         State: home/light/<id>/state — payload: ON|OFF
 
+    ALSA mixer (MQTT Number)
+        Command: home/alsa/<id>/set — payload: 0..100
+        State: home/alsa/<id>/state — payload: 0..100 (int)
+
 Availability (LWT): home/cover_devices/<device_id>/status and home/light_devices/<device_id>/status (online|offline).
 
 
@@ -220,8 +243,8 @@ Copy unit files from systemd/ and enable the services:
 ```
 sudo cp systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable shutter-server.service light-server.service button-client.service
-sudo systemctl start  shutter-server.service light-server.service button-client.service
+sudo systemctl enable shutter-server.service light-server.service alsa-server.service button-client.service
+sudo systemctl start  shutter-server.service light-server.service alsa-server.service button-client.service
 ```
 
 Check status/logs:
